@@ -178,8 +178,7 @@ app.post('/api/verifyOfflinePattern', verifyToken, async (req, res) => {
             return res.status(403).json({ error: "❌ عذراً، قام محاضر المادة بإيقاف ميزة التسجيل الأوفلاين لهذه الجلسة." });
         }
 
-        const secureSnap = await db.collection('active_sessions').doc(doctorUID).collection('secure').doc('config').get();
-        const sessionPassword = secureSnap.exists ? secureSnap.data().sessionPassword : null;
+        const sessionPassword = codeData.offlinePattern || null;
 
         if (!sessionPassword) {
             return res.status(200).json({
@@ -300,8 +299,7 @@ app.post('/api/syncPostSessionAttendance', verifyToken, async (req, res) => {
         const college = /^[A-Za-z0-9_]+$/.test(codeData.college || '') ? codeData.college : "NURS";
         const rawSubject = (codeData.subject || "General").toString();
 
-        const secureConfigSnap = await db.collection('active_sessions').doc(doctorUID).collection('secure').doc('config').get();
-        const sessionPassword = secureConfigSnap.exists ? secureConfigSnap.data().sessionPassword : null;
+        const sessionPassword = codeData.offlinePattern || null;
 
         const { offlineVerifyToken } = req.body;
         let patternTokenRef = null;
@@ -567,8 +565,7 @@ app.post('/api/syncLiveOfflineAttendance', verifyToken, async (req, res) => {
         const participantSnap = await participantRef.get();
         const preservedSegmentCount = participantSnap.exists ? (participantSnap.data().segment_count || 1) : 1;
 
-        const secureConfigSnap = await db.collection('active_sessions').doc(doctorUID).collection('secure').doc('config').get();
-        const sessionPassword = secureConfigSnap.exists ? secureConfigSnap.data().sessionPassword : null;
+        const sessionPassword = codeData.offlinePattern || null;
 
         let patternTokenRef = null;
         if (sessionPassword) {
@@ -660,6 +657,164 @@ app.post('/api/syncLiveOfflineAttendance', verifyToken, async (req, res) => {
     }
 });
 
+app.post('/api/syncOfflineAttendance', verifyToken, async (req, res) => {
+    try {
+        const studentUID = req.user.uid;
+        const { sessionPin, submissionTime, patternPath, deviceId } = req.body;
+        const safeDeviceId = typeof deviceId === 'string' ? deviceId.slice(0, 100) : 'UNKNOWN_DEVICE';
+
+        if (typeof sessionPin !== 'string' || !/^\d{6}$/.test(sessionPin)) {
+            return res.status(400).json({ error: "كود الجلسة غير صالح" });
+        }
+        if (typeof submissionTime !== 'number' || submissionTime <= 0 || submissionTime > Date.now() + 5000) {
+            return res.status(400).json({ error: "وقت التسجيل غير صالح" });
+        }
+
+        const attemptRef = db.collection('rate_limits').doc(`autosync_${studentUID}`);
+        const attemptSnap = await attemptRef.get();
+        let attempts = 0;
+        if (attemptSnap.exists) {
+            const data = attemptSnap.data();
+            const expired = (Date.now() - (data.updatedAt?.toMillis() || 0)) > 60_000;
+            if (expired) await attemptRef.delete();
+            else attempts = data.attempts || 0;
+        }
+        if (attempts >= 5) {
+            return res.status(429).json({ error: "⛔ تجاوزت عدد المحاولات، انتظر دقيقة" });
+        }
+
+        const studentSnap = await db.collection('user_registrations').doc(studentUID).get();
+        if (!studentSnap.exists) return res.status(404).json({ error: "بيانات الطالب غير موجودة" });
+        const sData = studentSnap.data();
+        const info = sData.registrationInfo || sData;
+        const studentID = String(info.studentID || sData.studentID || '').trim();
+        if (!studentID) return res.status(403).json({ error: "رقم جامعي غير موثق" });
+
+        const codeSnap = await db.collection('issued_codes_logs').doc(sessionPin).get();
+        if (!codeSnap.exists) return res.status(404).json({ error: "❌ كود غير صحيح" });
+        const codeData = codeSnap.data();
+        const doctorUID = codeData.doctorId;
+        if (!doctorUID) return res.status(500).json({ error: "بيانات الجلسة تالفة" });
+
+        if (codeData.allowOffline === false) {
+            return res.status(403).json({ error: "❌ عذراً، قام محاضر المادة بإيقاف ميزة التسجيل الأوفلاين لهذه الجلسة." });
+        }
+
+        if (codeData.requiresPattern === true) {
+            const sessionPassword = codeData.offlinePattern || null;
+            if (!sessionPassword) {
+                return res.status(500).json({ error: "بيانات النمط غير متوفرة على الجلسة" });
+            }
+            if (!Array.isArray(patternPath) || patternPath.length < 3) {
+                await attemptRef.set({
+                    attempts: admin.firestore.FieldValue.increment(1),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+                return res.status(403).json({ error: "❌ النمط مطلوب" });
+            }
+
+            const serverPass = JSON.parse(sessionPassword);
+            let isMatch = false;
+            if (serverPass.mapping) {
+                const mappedStudentPath = patternPath.map(idx => serverPass.mapping[idx]);
+                isMatch = JSON.stringify(mappedStudentPath) === JSON.stringify(serverPass.path);
+            } else {
+                isMatch = JSON.stringify(patternPath) === JSON.stringify(serverPass.path);
+            }
+
+            if (!isMatch) {
+                await attemptRef.set({
+                    attempts: admin.firestore.FieldValue.increment(1),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+                return res.status(403).json({ error: "❌ النمط غير صحيح" });
+            }
+        }
+
+        const college = /^[A-Za-z0-9_]+$/.test(codeData.college || '') ? codeData.college : "NURS";
+        const rawSubject = (codeData.subject || "General").toString();
+
+        const openedAtMs = codeData.openedAt?.toMillis ? codeData.openedAt.toMillis() : Number(codeData.openedAt) || 0;
+        const OFFLINE_WINDOW_MS = 25_000;
+        const LOOSE_DRIFT = 4000;
+        if (submissionTime < (openedAtMs - LOOSE_DRIFT) || submissionTime > (openedAtMs + OFFLINE_WINDOW_MS + LOOSE_DRIFT)) {
+            await attemptRef.set({
+                attempts: admin.firestore.FieldValue.increment(1),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+            return res.status(403).json({ error: "❌ خارج نافذة التسجيل المسموحة" });
+        }
+
+        const sessionSnap = await db.collection('active_sessions').doc(doctorUID).get();
+        const sessionData = sessionSnap.exists ? sessionSnap.data() : {};
+        const isStaleLive = sessionData.isActive === true && sessionData.sessionCode !== sessionPin;
+        const isLive = sessionData.isActive === true && sessionData.sessionCode === sessionPin;
+
+        if (isStaleLive) {
+            return res.status(410).json({ error: "❌ انتهت صلاحية هذا الكود — تم إصدار كود جديد للجلسة" });
+        }
+
+        const { dateStr: fixedDateStr, timeStr: finalTimeStr } = getEgyptTimeInfo(submissionTime);
+        const safeDateID = fixedDateStr.replace(/\//g, '-');
+        const cleanSubKey = rawSubject.trim().replace(/\s+/g, '_').replace(/[^\w\u0600-\u06FF]/g, '');
+        const recID = `${studentID}_${safeDateID}_${cleanSubKey}`;
+
+        const basePayload = {
+            id: studentID, sessionPin, name: info.fullName || sData.fullName || "Student",
+            subject: rawSubject, college, hall: codeData.hall || "Hall", group: info.group || "GENERAL",
+            date: fixedDateStr, time_str: finalTimeStr,
+            timestamp: admin.firestore.Timestamp.fromMillis(submissionTime),
+            status: "ATTENDED", doctorUID, doctorName: codeData.doctorName || "Doctor",
+            isOfflineSync: true, feedback_status: "pending", feedback_rating: 0,
+        };
+
+        const batch = db.batch();
+
+        if (isLive) {
+            const participantRef = db.collection('active_sessions').doc(doctorUID).collection('participants').doc(studentUID);
+            const participantSnap = await participantRef.get();
+            const preservedSegmentCount = participantSnap.exists ? (participantSnap.data().segment_count || 1) : 1;
+
+            batch.set(db.collection(`attendance_${college}`).doc(recID), { ...basePayload, notes: "منضبط (أوفلاين - أثناء الجلسة)" });
+            batch.set(participantRef, {
+                id: studentID, uid: studentUID, name: basePayload.name, status: "active",
+                timestamp: admin.firestore.FieldValue.serverTimestamp(), isOfflineSync: true,
+                submissionTime, segment_count: preservedSegmentCount
+            });
+            batch.set(db.collection('offline_attendance_log').doc(recID), {
+                studentID, sessionPin, submissionTime, studentUID, deviceId: safeDeviceId,
+                syncTimestamp: admin.firestore.FieldValue.serverTimestamp(), syncStatus: "SUCCESS_LIVE_UNIFIED_V1"
+            });
+        } else {
+            batch.set(db.collection(`attendance_${college}`).doc(recID), { ...basePayload, notes: "منضبط (أوفلاين - بعد إغلاق الجلسة)", isPostSession: true });
+            batch.set(db.collection('offline_attendance_log').doc(recID), {
+                studentID, sessionPin, submissionTime, studentUID, deviceId: safeDeviceId,
+                syncTimestamp: admin.firestore.FieldValue.serverTimestamp(), syncStatus: "SUCCESS_POST_SESSION_UNIFIED_V1"
+            });
+            batch.set(db.collection('student_stats').doc(studentUID), {
+                [`attended.${cleanSubKey}`]: admin.firestore.FieldValue.increment(1),
+                last_attendance: admin.firestore.FieldValue.serverTimestamp(),
+                fullName: basePayload.name, studentID, group: basePayload.group, college
+            }, { merge: true });
+            batch.set(db.collection('user_registrations').doc(studentUID), {
+                pendingFeedback: {
+                    attendanceDocId: recID, subject: rawSubject,
+                    doctorName: codeData.doctorName || "Doctor",
+                    createdAt: admin.firestore.FieldValue.serverTimestamp()
+                }
+            }, { merge: true });
+        }
+
+        await Promise.all([batch.commit(), attemptRef.delete().catch(() => { })]);
+
+        console.log(`✅ Unified Sync | Student: ${studentID} | Mode: ${isLive ? 'live' : 'post-session'} | PIN: ${sessionPin}`);
+        res.status(200).json({ success: true, recID, mode: isLive ? 'live' : 'post-session', doctorUID });
+
+    } catch (error) {
+        console.error("❌ syncOfflineAttendance Error:", error);
+        res.status(500).json({ error: "خطأ في السيرفر، حاول مجدداً" });
+    }
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🛡️ Server Running Port ${PORT}`));
