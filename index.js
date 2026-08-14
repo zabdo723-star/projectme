@@ -48,7 +48,7 @@ app.use(cors({
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-recaptcha-token', 'X-Firebase-AppCheck']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 
 const COLLEGE_COORDS = {
@@ -71,20 +71,6 @@ const verifyToken = async (req, res, next) => {
     }
 };
 
-const verifyAppCheck = async (req, res, next) => {
-    const token = req.headers['x-firebase-appcheck'];
-    if (!token) {
-        console.warn('⛔ [AppCheck][MONITOR] Missing token —', req.path, '| UID:', req.user?.uid || 'unknown');
-        return next();
-    }
-    try {
-        await admin.appCheck().verifyToken(token);
-        next();
-    } catch (e) {
-        console.warn('⛔ [AppCheck][MONITOR] Invalid token —', req.path, e.message, '| UID:', req.user?.uid || 'unknown');
-        return next();
-    }
-};
 
 const verifyStaffRole = async (req, res, next) => {
     try {
@@ -146,7 +132,7 @@ app.get('/api/config', (req, res) => {
     });
 });
 
-app.post('/api/verifyOfflinePattern', verifyToken, verifyAppCheck, async (req, res) => {
+app.post('/api/verifyOfflinePattern', verifyToken, async (req, res) => {
     try {
         const studentUID = req.user.uid;
         const { sessionPin, patternPath } = req.body;
@@ -253,7 +239,7 @@ app.post('/api/verifyOfflinePattern', verifyToken, verifyAppCheck, async (req, r
     }
 });
 
-app.post('/api/syncPostSessionAttendance', verifyToken, verifyAppCheck, async (req, res) => {
+app.post('/api/syncPostSessionAttendance', verifyToken, async (req, res) => {
     try {
         const studentUID = req.user.uid;
         const { sessionPin, submissionTime, deviceId } = req.body;
@@ -482,7 +468,7 @@ app.post('/api/syncPostSessionAttendance', verifyToken, verifyAppCheck, async (r
     }
 });
 
-app.post('/api/syncFeedback', verifyToken, verifyAppCheck, async (req, res) => {
+app.post('/api/syncFeedback', verifyToken, async (req, res) => {
     try {
         const studentUID = req.user.uid;
         const { studentId, doctorUID, subject, date, rating } = req.body;
@@ -520,7 +506,7 @@ app.post('/api/syncFeedback', verifyToken, verifyAppCheck, async (req, res) => {
 });
 
 
-app.post('/api/syncLiveOfflineAttendance', verifyToken, verifyAppCheck, async (req, res) => {
+app.post('/api/syncLiveOfflineAttendance', verifyToken, async (req, res) => {
     try {
         const studentUID = req.user.uid;
         const { sessionPin, submissionTime, patternInput, offlineVerifyToken, deviceId } = req.body;
