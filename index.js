@@ -82,7 +82,7 @@ const verifyAppCheck = async (req, res, next) => {
         next();
     } catch (e) {
         console.warn('⛔ [AppCheck][MONITOR] Invalid token —', req.path, e.message, '| UID:', req.user?.uid || 'unknown');
-        return next(); 
+        return next();
     }
 };
 
