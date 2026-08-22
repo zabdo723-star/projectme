@@ -834,6 +834,50 @@ app.post('/api/syncOfflineAttendance', verifyToken, async (req, res) => {
         await Promise.all([batch.commit(), attemptRef.delete().catch(() => { })]);
 
         console.log(`✅ Unified Sync | Student: ${studentID} | Mode: ${isLive ? 'live' : 'post-session'} | PIN: ${sessionPin}`);
+
+        if (!isLive) {
+            try {
+                const { error: supErr } = await supabase
+                    .from('attendance_logs')
+                    .upsert([{
+                        student_id: studentID,
+                        student_name: basePayload.name,
+                        subject_name: rawSubject,
+                        college: college,
+                        hall: codeData.hall || "",
+                        target_group: basePayload.group,
+                        sis_code: codeData.sisCode || "",
+                        session_date: fixedDateStr,
+                        attendance_time: finalTimeStr,
+                        status: "ATTENDED",
+                        is_unruly: false,
+                        is_uniform_violation: false,
+                        notes: "منضبط (أوفلاين - بعد إغلاق الجلسة)",
+                        doctor_uid: doctorUID,
+                        doctor_name: codeData.doctorName || "Doctor",
+                        is_recovered: false,
+                        feedback_status: "pending",
+                        feedback_rating: 0,
+                        segment_count: 1,
+                        is_offline_sync: true,
+                        level: info.level || "-",
+                        group_name: basePayload.group,
+                        is_suspicious: false,
+                        trap_is_in_range: null,
+                        trap_is_device_match: null,
+                        trap_gps_success: null,
+                        trap_distance_km: null,
+                    }], {
+                        onConflict: 'student_id,subject_name,session_date,doctor_uid'
+                    });
+
+                if (supErr) console.error("❌ Supabase sync error (post-session offline):", supErr);
+                else console.log(`✅ Supabase synced (post-session offline) | Student: ${studentID} | PIN: ${sessionPin}`);
+            } catch (supEx) {
+                console.error("❌ Supabase exception (post-session offline):", supEx.message);
+            }
+        }
+
         res.status(200).json({ success: true, recID, mode: isLive ? 'live' : 'post-session', doctorUID });
 
     } catch (error) {
